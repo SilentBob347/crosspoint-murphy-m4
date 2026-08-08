@@ -1,0 +1,43 @@
+name: Murphy M4 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO Core
+        run: pip install -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Build Murphy M4 firmware
+        run: pio run -e murphy_m4
+
+      - name: Run static analysis
+        run: pio check -e murphy_m4 --fail-on-defect low --fail-on-defect medium --fail-on-defect high
+
+      - name: Upload application image
+        uses: actions/upload-artifact@v6
+        with:
+          name: murphy-m4-firmware
+          path: .pio/build/murphy_m4/firmware.bin
+          if-no-files-found: error
