@@ -130,7 +130,18 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   };
 
   // Short power button press actions
-  enum SHORT_PWRBTN { IGNORE = 0, SLEEP = 1, PAGE_TURN = 2, FORCE_REFRESH = 3, FOOTNOTES = 4, SHORT_PWRBTN_COUNT };
+  enum SHORT_PWRBTN {
+    IGNORE = 0,
+    SLEEP = 1,
+    PAGE_TURN = 2,
+    FORCE_REFRESH = 3,
+    FOOTNOTES = 4,
+    // Short click acts as the logical Confirm button everywhere (mapped in
+    // MappedInputManager): opens the reader menu, activates list rows. The
+    // no-touch path into the UI when touch reader controls are off.
+    PWR_CONFIRM = 5,
+    SHORT_PWRBTN_COUNT
+  };
 
   // Long-press Confirm action while reading an EPUB. The setting cycles through these values.
   // Persisted in settings.json by index: any new function (e.g. dictionary, bookmark) MUST use a
@@ -141,6 +152,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     LP_MENU_DISABLED = 1,
     LP_MENU_BOOKMARK = 2,
     LP_MENU_DICTIONARY = 3,
+    LP_MENU_READER_MENU = 4,
     LONG_PRESS_MENU_FUNCTION_COUNT
   };
 
@@ -163,7 +175,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
 
   enum TILT_PAGE_TURN { TILT_OFF = 0, TILT_NORMAL = 1, TILT_NVERTED = 2, TILT_PAGE_TURN_COUNT };
 
-  enum TOUCH_READER_CONTROLS { TOUCH_READER_OFF = 0, TOUCH_READER_ON = 1, TOUCH_READER_CONTROLS_COUNT };
+  enum TOUCH_READER_CONTROLS {
+    TOUCH_READER_OFF = 0,
+    TOUCH_READER_ON = 1,
+    TOUCH_READER_SWIPE = 2,
+    TOUCH_READER_CONTROLS_COUNT
+  };
 
   enum QUICK_RESUME_SLEEP_SCREEN {
     QUICK_RESUME_NEVER = 0,
@@ -276,15 +293,24 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t tiltPageTurn = TILT_OFF;
   // Touch screen reader zones/gestures on boards with a touch controller.
   uint8_t touchReaderControls = TOUCH_READER_ON;
+  // Frontlight quick-panel state (boards with FREEINK_CAP_FRONTLIGHT, e.g. X4
+  // Pro). Applied at boot, edited only from the frontlight panel; persisted as
+  // category-less entries so they stay out of the Settings screen. Writes are
+  // debounced by the panel (saved once on exit), not per slider tick.
+  uint8_t frontlightBrightness = 60;
+  uint8_t frontlightWarmth = 50;  // 0 = cool .. 100 = warm
+  uint8_t frontlightOn = 0;
+  // Output inversion selected from the frontlight quick panel. Sleep screens
+  // temporarily ignore it, but normal UI restores it after wake.
+  uint8_t screenInverted = 0;
+  // When 0 (default), the frontlight always comes up OFF after a wake/boot (brightness
+  // and warmth are still remembered for when it's switched on). When 1, the on/off
+  // state from before sleep is restored too. Shown in Display settings on frontlight boards.
+  uint8_t frontlightRestoreOnWake = 0;
   // Language setting (Language enum index, default 0 = EN)
   uint8_t language = 0;
   // Quick Resume: keep current content visible with moon icon instead of showing a static sleep screen.
   uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
-  // Murphy M4 dual-channel frontlight. Brightness is deliberately 8-bit so
-  // level 1 can use the smallest non-zero PWM duty.
-  uint8_t frontlightEnabled = 0;
-  uint8_t frontlightBrightness = 1;
-  uint8_t frontlightWarmth = 70;
 
   static constexpr uint8_t MIN_SLEEP_TIMEOUT_MINUTES = 1;
   static constexpr uint8_t SLEEP_TIMEOUT_NEVER_MINUTES = 31;
@@ -297,7 +323,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   void* sdFontResolverCtx = nullptr;
 
   uint16_t getPowerButtonDuration() const {
-    return (shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) ? 10 : 400;
+    return (shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) ? 10 : 300;
   }
   int getReaderFontId() const;
 

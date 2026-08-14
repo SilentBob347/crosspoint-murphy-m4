@@ -6,6 +6,7 @@
 #include <GfxRenderer.h>
 #include <HalClock.h>
 #include <HalDisplay.h>
+#include <HalFrontlight.h>
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
@@ -15,13 +16,16 @@
 #include <Logging.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <XteinkDetect.h>
 #include <builtinFonts/all.h>
+#include <driver/gpio.h>
+#include <esp_sntp.h>
+#include <soc/soc_caps.h>
 
 #include <cstring>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
-#include "FrontlightController.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
@@ -33,6 +37,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "nvs.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -43,6 +48,12 @@ FontDecompressor fontDecompressor;
 SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
 static unsigned long allowSleepAt = 0;
+static unsigned long lastX4ProPowerClickAt = 0;
+
+namespace {
+constexpr unsigned long X4PRO_POWER_DOUBLE_CLICK_MS = 500;
+constexpr unsigned long X4PRO_POWER_CLICK_MAX_HOLD_MS = 300;
+}  // namespace
 
 // Fonts
 EpdFont notoserif14RegularFont(&notoserif_14_regular);
@@ -137,8 +148,24 @@ enum class BootResume : uint8_t {
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
 
+static bool finishWifiSessionWithoutRestart() {
+  // Touch controllers and frontlights can live on external rails that a
+  // software SoC reset does not reliably cycle. Select normal WiFi teardown
+  // through the SDK capability instead of maintaining board-name exceptions.
+  if (!BoardConfig::hasTouch()) return false;
+
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop();
+  }
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  LOG_DBG("MAIN", "WiFi stopped without silent restart on touch device");
+  return true;
+}
+
 void silentRestart() {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
+  if (finishWifiSessionWithoutRestart()) return;
   silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_DBG("MAIN", "Silent restart (target=home)");
@@ -153,6 +180,7 @@ void silentRestart() {
 
 void silentRestartToReader() {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
+  if (finishWifiSessionWithoutRestart()) return;
   silentRebootTarget = SILENT_REBOOT_TARGET_READER;
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_DBG("MAIN", "Silent restart (target=reader)");
@@ -167,6 +195,31 @@ void waitForPowerRelease() {
     delay(50);
     gpio.update();
   }
+}
+
+bool handleX4ProFrontlightDoubleClick() {
+  if (!BoardConfig::isX4Pro() || !gpio.wasReleased(HalGPIO::BTN_POWER)) {
+    return false;
+  }
+
+  const unsigned long now = millis();
+  if (gpio.getPowerButtonHeldTime() > X4PRO_POWER_CLICK_MAX_HOLD_MS) {
+    lastX4ProPowerClickAt = 0;
+    return false;
+  }
+
+  if (lastX4ProPowerClickAt == 0 || now - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
+    lastX4ProPowerClickAt = now;
+    return false;
+  }
+
+  lastX4ProPowerClickAt = 0;
+  const bool lightOn = !Frontlight.isOn();
+  Frontlight.setOn(lightOn);
+  SETTINGS.frontlightOn = lightOn ? 1 : 0;
+  SETTINGS.saveToFile();
+  LOG_INF("LIGHT", "Frontlight toggled %s by power-button double-click", lightOn ? "on" : "off");
+  return true;
 }
 
 constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
@@ -190,6 +243,36 @@ static bool loadSleepFrameBuffer() {
   }
   Storage.remove(SLEEP_FRAME_FILE);
   return true;
+}
+
+// The wake-hold verification runs before the SD card is mounted (see setup()),
+// so the one setting it needs — "short press = sleep", which makes any tap a
+// valid wake — is mirrored into NVS. Written at sleep entry (the value that
+// matters is the one in force when the device went down) and re-synced after
+// each settings load in case the device lost power without a clean sleep.
+constexpr char WAKE_NVS_NAMESPACE[] = "crosspoint";
+constexpr char WAKE_SHORT_PRESS_KEY[] = "wakeShortPr";
+
+bool readWakeShortPressFromNvs() {
+  nvs_handle_t h;
+  if (nvs_open(WAKE_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+  uint8_t v = 0;
+  const esp_err_t e = nvs_get_u8(h, WAKE_SHORT_PRESS_KEY, &v);
+  nvs_close(h);
+  return e == ESP_OK && v != 0;
+}
+
+void mirrorWakeShortPressToNvs() {
+  const uint8_t want = (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) ? 1 : 0;
+  nvs_handle_t h;
+  if (nvs_open(WAKE_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+  uint8_t cur = 0;
+  const bool have = nvs_get_u8(h, WAKE_SHORT_PRESS_KEY, &cur) == ESP_OK;
+  if (!have || cur != want) {  // skip the flash write when unchanged
+    nvs_set_u8(h, WAKE_SHORT_PRESS_KEY, want);
+    nvs_commit(h);
+  }
+  nvs_close(h);
 }
 
 // Enter deep sleep mode
@@ -223,12 +306,32 @@ void enterDeepSleep(bool fromTimeout = false) {
 
   halTiltSensor.deepSleep();
   display.deepSleep();
+  mirrorWakeShortPressToNvs();  // next boot's wake-hold check reads this pre-SD
   LOG_DBG("MAIN", "Entering deep sleep");
 
   powerManager.startDeepSleep(gpio);
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
+#if !FREEINK_MCU_C3
+  // Resolve the panel controller before display.begin() selects the driver.
+  // GUARD RATIONALE (mirrors HalGPIO::begin's C3 block): on the C3 X3/X4,
+  // HalGPIO already runs applyXteinkDisplayController() BEFORE its SPI.begin(),
+  // so probing again here — after SPI owns the pins, right before display.begin()
+  // — re-resets the panel mid-teardown and FROZE the X3. But on the S3 X4 Pro,
+  // HalGPIO's C3-only block is skipped entirely (no probe, no SPI.begin there);
+  // the X4 Pro's SPI.begin() happens inside display.begin(), so THIS is the only
+  // spot the probe can run before it. Hence: probe here only on non-C3 boards.
+  // applyXteinkDisplayController() is a compiled no-op without a UC81xx sibling.
+  static bool controllerResolved = false;
+  if (!controllerResolved) {
+    controllerResolved = true;
+    if (freeink::applyXteinkDisplayController()) {
+      LOG_DBG("MAIN", "Panel controller: UltraChip UC81xx variant detected");
+    }
+  }
+#endif
+
   display.begin(seamless);
   renderer.begin();
   activityManager.begin();
@@ -290,11 +393,71 @@ void setup() {
   silentRebootTarget = 0;
 
   gpio.begin();
+
+#if !SOC_PM_SUPPORT_EXT1_WAKEUP
+  // X4 battery latch: GPIO13 drives the battery MOSFET gate. Deep sleep holds
+  // it low to power off (see HalPowerManager::startDeepSleep); on known units
+  // the latch pulls itself on again at the next power-button press, but at
+  // least one hardware revision in the field does not self-latch and stays
+  // powered only while the button is physically held — the device dies a
+  // second or two after release, at whatever boot stage it happened to reach.
+  // Release any leftover sleep hold and actively drive the latch on. On
+  // self-latching units this drives the pin to the state it is already in.
+  if (gpio.isXteinkDevice() && !gpio.deviceIsX3()) {
+    constexpr gpio_num_t X4_BATTERY_LATCH = GPIO_NUM_13;
+    gpio_hold_dis(X4_BATTERY_LATCH);
+    gpio_set_direction(X4_BATTERY_LATCH, GPIO_MODE_OUTPUT);
+    gpio_set_level(X4_BATTERY_LATCH, 1);
+  }
+#endif
+
   powerManager.begin();
   halTiltSensor.begin();
   halClock.begin();
 
-  LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : gpio.deviceIsMurphyM4() ? "Murphy M4" : "X4");
+#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3
+  LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+#else
+  LOG_INF("MAIN", "Device: %s", BoardConfig::ACTIVE.name);
+#endif
+
+  // Verify the wake reason BEFORE the SD mount and settings loads. The power
+  // button must still be held when the check runs (released = back to sleep),
+  // so everything ahead of it extends the real-world hold requirement — and
+  // the SD mount (per-attempt power-cycle retries on some boards) is the
+  // slowest, most variable stage of boot. Verifying here needs only gpio +
+  // powerManager; the one setting involved ("short press = sleep" makes any
+  // tap a valid wake) comes from its NVS mirror since SETTINGS lives on the
+  // not-yet-mounted SD card. Bonus: an accidental USB-power boot goes back to
+  // sleep without paying for an SD mount first.
+  const auto wakeupReason = gpio.getWakeupReason();
+  switch (wakeupReason) {
+    case HalGPIO::WakeupReason::PowerButton: {
+      LOG_DBG("MAIN", "Verifying power button press duration");
+      const bool shortPressWakes = readWakeShortPressFromNvs();
+      if (!gpio.verifyPowerButtonWakeup(shortPressWakes ? 10 : 300, shortPressWakes)) {
+        powerManager.startDeepSleep(gpio);
+      }
+      break;
+    }
+    case HalGPIO::WakeupReason::AfterUSBPower:
+      // If USB power caused a cold boot, go back to sleep
+      LOG_DBG("MAIN", "Wakeup reason: After USB Power");
+#if FREEINK_DEVICE_PAPERMONO
+      // No armable GPIO wake (the power button is behind the PMIC): sleeping
+      // here would strand the device until the next USB replug, which lands
+      // right back in this case. Boot instead.
+      break;
+#else
+      powerManager.startDeepSleep(gpio);
+      break;
+#endif
+    case HalGPIO::WakeupReason::AfterFlash:
+      // After flashing, just proceed to boot
+    case HalGPIO::WakeupReason::Other:
+    default:
+      break;
+  }
 
   // SD Card Initialization
   // We need 6 open files concurrently when parsing a new chapter
@@ -308,7 +471,6 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
-  frontlightController.begin();
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
@@ -316,31 +478,31 @@ void setup() {
   OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
+  // Frontlight PWM up (no-op on boards without one). Brightness + warmth are always
+  // restored from persisted settings. The on/off state defaults to OFF at wake/boot —
+  // so the user isn't greeted by a surprise glow (or a silent battery drain) — unless
+  // "Restore Light on Wake" is enabled, which brings back the pre-sleep on/off state too.
+  // A silent restart is different: it's an automated heap-defrag reboot the user never
+  // asked for (e.g. leaving a WiFi activity), not a deliberate sleep, so we always bring
+  // the light back exactly as they left it rather than surprising them with darkness.
+  const bool restoreLightOn = SETTINGS.frontlightOn != 0 && (SETTINGS.frontlightRestoreOnWake != 0 || isSilentReboot);
+  Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
 
-  const auto wakeupReason = gpio.getWakeupReason();
-  switch (wakeupReason) {
-    case HalGPIO::WakeupReason::PowerButton:
-      LOG_DBG("MAIN", "Verifying power button press duration");
-      if (!gpio.verifyPowerButtonWakeup(SETTINGS.getPowerButtonDuration(),
-                                        SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP)) {
-        powerManager.startDeepSleep(gpio);
-      }
-      break;
-    case HalGPIO::WakeupReason::AfterUSBPower:
-      // If USB power caused a cold boot, go back to sleep
-      LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      powerManager.startDeepSleep(gpio);
-      break;
-    case HalGPIO::WakeupReason::AfterFlash:
-      // After flashing, just proceed to boot
-    case HalGPIO::WakeupReason::Other:
-    default:
-      break;
-  }
+  // Re-sync the wake-hold NVS mirror with the freshly-loaded settings, covering
+  // a setting change followed by power loss without a clean sleep. (The wake
+  // verification itself already ran, pre-SD, further up.)
+  mirrorWakeShortPressToNvs();
 
-  // Recovery firmware mode: hold left side button (BTN_UP) together with the power button at
-  // boot to skip directly to the SD-card firmware update screen. Useful on devices where USB
-  // flashing has been locked down (e.g. recent X3 firmware).
+  // Recovery firmware mode: hold the side button(s) together with the power button at boot to
+  // skip directly to the SD-card firmware update screen. Useful on devices where USB flashing
+  // has been locked down (e.g. recent X3 firmware).
+  //
+  // X4 Pro caveat: BTN_UP maps to GPIO0, an ESP32-S3 boot-strap pin that can read LOW at boot
+  // (weak/absent idle pull, or a stuck key), which would false-trigger recovery on every power-on
+  // and strand the device in the SD update screen. So on the X4 Pro gate recovery on BTN_DOWN
+  // (GPIO7) ONLY — a non-strap pin with a reliable idle-HIGH pull — and drop the strap pin from
+  // the gesture entirely, so GPIO0's state can never force recovery. Other boards keep the
+  // original single-button (BTN_UP) gesture.
   bool recoveryFirmwareMode = false;
   if (wakeupReason == HalGPIO::WakeupReason::PowerButton) {
     // Refresh the cached button state a few times — isPressed() needs ~half a second to settle
@@ -351,9 +513,19 @@ void setup() {
       gpio.update();
       delay(10);
     }
-    if (gpio.isPressed(HalGPIO::BTN_UP)) {
+    const bool up = gpio.isPressed(HalGPIO::BTN_UP);
+    const bool down = gpio.isPressed(HalGPIO::BTN_DOWN);
+    // Diagnostic: raw pin levels alongside the debounced state, so a stuck/floating strap pin is
+    // visible in the boot log (BTN_UP = GPIO0 on the X4 Pro).
+    const int8_t upPin = BoardConfig::ACTIVE.input.up;
+    const int8_t downPin = BoardConfig::ACTIVE.input.down;
+    LOG_INF("MAIN", "Recovery check: up=%d(raw %d) down=%d(raw %d)", up, upPin >= 0 ? digitalRead(upPin) : -1, down,
+            downPin >= 0 ? digitalRead(downPin) : -1);
+    // X4 Pro: BTN_DOWN (GPIO7) only — never the GPIO0 strap pin. Other boards: BTN_UP.
+    const bool comboHeld = BoardConfig::isX4Pro() ? down : up;
+    if (comboHeld) {
       recoveryFirmwareMode = true;
-      LOG_INF("MAIN", "Recovery firmware mode (UP + POWER held at boot)");
+      LOG_INF("MAIN", "Recovery firmware mode (%s + POWER held at boot)", BoardConfig::isX4Pro() ? "DOWN" : "UP");
     }
   }
 
@@ -406,6 +578,9 @@ void setup() {
       activityManager.goToBoot();
       break;
   }
+
+  // Output polarity is resolved per render by ActivityManager (night mode
+  // inverts only the reading surfaces), so nothing to restore here.
 
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
@@ -524,6 +699,23 @@ void loop() {
     screenshotComboActive = false;
   }
 
+  // X4 Pro-only frontlight shortcut. Consume the second release so a configured
+  // short-power action does not also run for the click that toggled the light.
+  if (handleX4ProFrontlightDoubleClick()) {
+    return;
+  }
+
+  // PWR_CONFIRM on the X4 Pro: the power button also carries the double-click
+  // frontlight toggle above, so a single click only becomes a Confirm press
+  // once the double-click window passes with no second click. The flag is
+  // frame-scoped: true for exactly the frame where the click matures.
+  mappedInputManager.setPowerConfirmClickFrame(false);
+  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM && BoardConfig::isX4Pro() &&
+      lastX4ProPowerClickAt != 0 && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
+    lastX4ProPowerClickAt = 0;
+    mappedInputManager.setPowerConfirmClickFrame(true);
+  }
+
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
   if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
@@ -532,7 +724,17 @@ void loop() {
     return;
   }
 
-  if (millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
+  // A power-button hold carried over from the wake gesture must not count as an
+  // in-app long-press-to-sleep. Otherwise the device boots (restoring the light),
+  // then ~2 s later (allowSleepAt) the still-held button trips the sleep below
+  // without the user ever releasing — leaving them stuck on the sleep screen
+  // unless they release inside a narrow window between the wake-verify hold and
+  // this timeout. Only arm the held-power sleep after the button has been
+  // released at least once since wake, so a genuine in-session hold is required.
+  static bool powerReleasedSinceWake = false;
+  if (!gpio.isPressed(HalGPIO::BTN_POWER)) powerReleasedSinceWake = true;
+
+  if (powerReleasedSinceWake && millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
       gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
     // If the screenshot combination is potentially being pressed, don't sleep
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
@@ -542,6 +744,20 @@ void loop() {
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
   }
+
+#if FREEINK_DEVICE_PAPERMONO
+  // The power button is a PMIC click event (one-tick BTN_POWER pulse), so the
+  // held-time sleep path above cannot fire. Sleep on the release event, and by
+  // default (IGNORE) too — a click is this board's only power-button signal;
+  // an explicit non-sleep binding repurposes it. allowSleepAt guards against a
+  // click latched in the PMIC's read-clear status register from the wake.
+  if ((SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP ||
+       SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::IGNORE) &&
+      millis() >= allowSleepAt && mappedInputManager.wasReleased(MappedInputManager::Button::Power)) {
+    enterDeepSleep();
+    return;
+  }
+#endif
 
   // Refresh screen when power button is short-pressed with FORCE_REFRESH setting.
   if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
@@ -557,6 +773,23 @@ void loop() {
   // Placed after sleep guards so we never queue a render that won't be processed.
   if (gpio.wasUsbStateChanged()) {
     activityManager.requestUpdate();
+  }
+
+  // While on external power the percent climbs with no user interaction to
+  // repaint it (gauge boards like the X4 Pro report SoC continuously), so poll
+  // for a change once a minute. Off-charger the percent moves too slowly to
+  // justify unsolicited e-ink refreshes.
+  if (gpio.isUsbConnected()) {
+    static unsigned long lastBatteryPollTime = 0UL;
+    static uint16_t lastBatteryPercent = 0xFFFF;
+    if (millis() - lastBatteryPollTime >= 60000UL) {
+      lastBatteryPollTime = millis();
+      const uint16_t percent = powerManager.getBatteryPercentage();
+      if (lastBatteryPercent != 0xFFFF && percent != lastBatteryPercent) {
+        activityManager.requestUpdate();
+      }
+      lastBatteryPercent = percent;
+    }
   }
 
   const unsigned long activityStartTime = millis();

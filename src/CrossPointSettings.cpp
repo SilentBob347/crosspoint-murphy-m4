@@ -1,5 +1,6 @@
 #include "CrossPointSettings.h"
 
+#include <BoardConfig.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <ObfuscationUtils.h>
@@ -103,9 +104,6 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   // Language -- managed by LanguageSelectActivity, not in SettingsList.
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (language < getLanguageCount()) ? LANGUAGE_CODES[language] : "EN";
-  doc["frontlightEnabled"] = frontlightEnabled;
-  doc["frontlightBrightness"] = frontlightBrightness;
-  doc["frontlightWarmth"] = frontlightWarmth;
 }
 
 bool CrossPointSettings::fromJson(JsonVariantConst doc) {
@@ -135,7 +133,13 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
         char obfKey[OBF_KEY_BUF];
         snprintf(obfKey, sizeof(obfKey), "%s_obf", info.key);
         bool ok = false;
-        const std::string decoded = obfuscation::deobfuscateFromBase64(doc[obfKey] | "", &ok);
+        bool tooLong = false;
+        const std::string decoded =
+            obfuscation::deobfuscateFromBase64(doc[obfKey] | "", info.stringMaxLen - 1, &ok, &tooLong);
+        if (tooLong) {
+          LOG_ERR("CPS", "Oversized obfuscated value for key '%s'", info.key);
+          needsResave = true;
+        }
         if (ok && !decoded.empty()) {
           copyToField(destPtr, decoded.c_str(), info.stringMaxLen);
           loaded = true;
@@ -217,9 +221,6 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   if (doc["language"].is<const char*>()) {
     language = static_cast<uint8_t>(I18n::languageFromCode(doc["language"].as<const char*>()));
   }
-  frontlightEnabled = clamp(doc["frontlightEnabled"] | (uint8_t)0, 2, 0);
-  frontlightBrightness = doc["frontlightBrightness"] | (uint8_t)1;
-  frontlightWarmth = std::min<uint8_t>(doc["frontlightWarmth"] | (uint8_t)70, 100);
 
   if (needsResave) {
     LOG_DBG("CPS", "Resaving settings to update format");

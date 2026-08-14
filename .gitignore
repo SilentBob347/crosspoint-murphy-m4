@@ -1,6 +1,4 @@
 .pio
-.platformio
-.python-version
 .idea
 .DS_Store
 .vscode
@@ -31,6 +29,6 @@ lib/EpdFont/scripts/output/
 /.dummy
 /CMakeLists.txt
 /dependencies.lock
-/sdkconfig.default
-/sdkconfig.defaults
+/sdkconfig.*
 sdkconfig.sticky
+sdkconfig.x4pro

@@ -1,12 +1,13 @@
 #include "ActivityManager.h"
 
 #include <FontCacheManager.h>
+#include <HalDisplay.h>
+#include <HalFrontlight.h>
 #include <HalPowerManager.h>
 
 #include <algorithm>
 
 #include "CrossPointSettings.h"
-#include "FrontlightController.h"
 #include "OpdsServerStore.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
@@ -17,9 +18,9 @@
 #include "home/RecentBooksActivity.h"
 #include "network/CrossPointWebServerActivity.h"
 #include "reader/ReaderActivity.h"
-#include "settings/FrontlightActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
+#include "util/FrontlightPanelActivity.h"
 #include "util/FullScreenMessageActivity.h"
 
 static portMUX_TYPE activityManagerSpinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -53,6 +54,10 @@ void ActivityManager::renderTaskLoop() {
     RenderLock lock;
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
+      // Night mode inverts only the reading surfaces (appliesNightMode):
+      // resolving the output polarity here, per render, means menus, popups,
+      // and every other activity revert to normal automatically.
+      display.setInverted(SETTINGS.screenInverted != 0 && currentActivity->appliesNightMode());
       currentActivity->render(std::move(lock));
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
@@ -69,29 +74,20 @@ void ActivityManager::renderTaskLoop() {
 
 void ActivityManager::loop() {
   if (currentActivity) {
-    const bool frontlightUp = mappedInput.isPressed(MappedInputManager::Button::Up);
-    const bool frontlightDown = mappedInput.isPressed(MappedInputManager::Button::Down);
-    if (frontlightChordLatched) {
-      if (!frontlightUp && !frontlightDown) frontlightChordLatched = false;
-      return;
-    }
-    if (frontlightController.present() && frontlightUp && frontlightDown) {
-      frontlightChordLatched = true;
-      SETTINGS.frontlightEnabled = !SETTINGS.frontlightEnabled;
-      frontlightController.apply();
-      SETTINGS.saveToFile();
-      requestUpdate();
-      return;
-    }
-    if (frontlightController.present() && !currentActivity->isFrontlightActivity() && mappedInput.wasMenuGesture()) {
-      pushActivity(std::make_unique<FrontlightActivity>(renderer, mappedInput));
-      return;
-    }
     if (!currentActivity->isHomeActivity() && mappedInput.wasHomeGesture()) {
       if (currentActivity->handleHomeGesture()) {
         return;
       }
       goHome();
+      return;
+    }
+
+    // Frontlight quick panel: global top-edge down-swipe on any board with a
+    // frontlight (the gesture itself is capability-gated in
+    // wasLightPanelGesture()). Pushed, so it returns to whatever was
+    // underneath — including mid-book.
+    if (Frontlight.present() && currentActivity->name != "FrontlightPanel" && mappedInput.wasLightPanelGesture()) {
+      pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
       return;
     }
 

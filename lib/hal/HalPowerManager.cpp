@@ -11,6 +11,10 @@
 
 #include "HalGPIO.h"
 
+#if FREEINK_DEVICE_PAPERMONO
+#include <M5Pm1.h>
+#endif
+
 HalPowerManager powerManager;  // Singleton instance
 
 void HalPowerManager::begin() {
@@ -73,13 +77,21 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
 #endif
 
 #if !SOC_PM_SUPPORT_EXT1_WAKEUP
-  if (gpio.isXteinkDevice() && !gpio.deviceIsX3()) {
-    // X4 GPIO13 is connected to the battery latch MOSFET. Keeping it low powers
-    // the MCU off on battery, while the SDK wake source still handles USB power.
-    constexpr gpio_num_t GPIO_SPIWP = GPIO_NUM_13;
-    gpio_set_direction(GPIO_SPIWP, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_SPIWP, 0);
-    gpio_hold_en(GPIO_SPIWP);
+  // Release the battery-latch pins (X4: GPIO13 gates the battery MOSFET) so the
+  // MCU powers off on battery, while the SDK wake source still handles USB
+  // power. Pin truth lives in BoardConfig (asserted at boot by
+  // holdPowerRails()); no-op on boards without a latch (X3). The hold keeps the
+  // pin low through deep sleep; boot's holdPowerRails() releases it on wake.
+  for (const int8_t pin : {BoardConfig::ACTIVE.power.latch0, BoardConfig::ACTIVE.power.latch1}) {
+    if (pin < 0) continue;
+    // Never drive a latch pin that is really a display/SD bus pin (e.g. GPIO13 is
+    // the X4 Pro's display CS) — pulling it low and holding it through sleep would
+    // clobber the bus. Matches holdPowerRails()'s guard on the assert side.
+    if (BoardConfig::latchConflictsWithBus(pin)) continue;
+    const auto latch = static_cast<gpio_num_t>(pin);
+    gpio_set_direction(latch, GPIO_MODE_OUTPUT);
+    gpio_set_level(latch, 0);
+    gpio_hold_en(latch);
   }
 #endif
 
@@ -91,6 +103,16 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // deep-sleep command while its rail is still up (enterDeepSleep() in main.cpp
   // guarantees that ordering).
   freeink::PowerManager::powerDownRailsForSleep();
+
+#if FREEINK_DEVICE_PAPERMONO
+  // The power button sits behind the M5PM1 PMIC (input.power unassigned), so
+  // deepSleepUntilPowerButton() would arm no wake source. Real "off" is a PMIC
+  // shutdown: rails collapse and a button click restarts through a cold boot.
+  // Falls through to plain deep sleep only if the PMIC write fails.
+  if (freeink::m5pm1::requestShutdown()) {
+    delay(1000);  // PY32 firmware processes the command; power drops in this window
+  }
+#endif
 
   // Waits for the power button to be physically released (so holding it doesn't
   // immediately wake the device again), then arms the wake source and sleeps.

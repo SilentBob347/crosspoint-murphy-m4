@@ -17,27 +17,6 @@
 
 #define UART0_RXD 20  // Used for USB connection detection
 
-// Xteink X3 Hardware
-#define X3_I2C_SDA 20
-#define X3_I2C_SCL 0
-#define X3_I2C_FREQ 400000
-
-// TI BQ27220 Fuel gauge I2C
-#define I2C_ADDR_BQ27220 0x55  // Fuel gauge I2C address
-#define BQ27220_SOC_REG 0x2C   // StateOfCharge() command code (%)
-#define BQ27220_CUR_REG 0x0C   // Current() command code (signed mA)
-#define BQ27220_VOLT_REG 0x08  // Voltage() command code (mV)
-
-// Analog DS3231 RTC I2C
-#define I2C_ADDR_DS3231 0x68  // RTC I2C address
-#define DS3231_SEC_REG 0x00   // Seconds command code (BCD)
-
-// QST QMI8658 IMU I2C
-#define I2C_ADDR_QMI8658 0x6B        // IMU I2C address
-#define I2C_ADDR_QMI8658_ALT 0x6A    // IMU I2C fallback address
-#define QMI8658_WHO_AM_I_REG 0x00    // WHO_AM_I command code
-#define QMI8658_WHO_AM_I_VALUE 0x05  // WHO_AM_I expected value
-
 class HalGPIO {
 #if CROSSPOINT_EMULATED == 0
   InputManager inputMgr;
@@ -47,7 +26,7 @@ class HalGPIO {
   bool usbStateChanged = false;
 
  public:
-  enum class DeviceType : uint8_t { X4, X3, MurphyM4 };
+  enum class DeviceType : uint8_t { X4, X3 };
 
  private:
   DeviceType _deviceType = DeviceType::X4;
@@ -58,8 +37,14 @@ class HalGPIO {
   // Inline device type helpers for cleaner downstream checks
   inline bool deviceIsX3() const { return _deviceType == DeviceType::X3; }
   inline bool deviceIsX4() const { return _deviceType == DeviceType::X4; }
-  inline bool deviceIsMurphyM4() const { return _deviceType == DeviceType::MurphyM4; }
   bool isXteinkDevice() const;
+
+  // True when the board's page buttons sit on the left/right screen edges
+  // (X3, X4 Pro) rather than an off-screen vertical rocker. Drives side-hint
+  // placement, the flipped large-step direction in selection activities, and
+  // the keyboard's side-gutter reserve. Keyed off the active BoardConfig
+  // profile, not the X3/X4 runtime detection.
+  bool hasEdgeSideButtons() const;
 
   // Start button GPIO and setup SPI for screen and SD card
   void begin();
@@ -74,10 +59,29 @@ class HalGPIO {
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
   bool hasTouch() const;
+  // Capacitive home key under the bezel, reported by the touch controller
+  // (e.g. X4 Pro's GT911 key). Tap = short press (fires on release, the primary
+  // "home" action); LongPress = held ~700ms (a hold shortcut, e.g. reader menu).
+  bool hasHomeKey() const;
+  bool wasHomeKeyPressed() const;
+  bool wasHomeKeyTapped() const;
+  bool wasHomeKeyLongPressed() const;
   bool wasTouchTap(float& nx, float& ny) const;
   bool wasTouchDown(float& nx, float& ny) const;
+  // Raw release edge, reported even when the contact was not a tap (swipe end,
+  // drag-off). Snapshot builders forward it so interaction routing can clear
+  // pressed state.
+  bool wasTouchReleased() const;
   bool isTouchTapCandidate(float& nx, float& ny, unsigned long& heldMs) const;
   bool isTouchHeldAt(float& nx, float& ny) const;
+  // One-shot long-press, fired by the SDK classifier while the finger is still
+  // down (stationary contact held past its threshold). Position = touch-down
+  // point. Callers that act on it should suppressTouchContact() so the lift
+  // cannot also tap.
+  bool wasTouchLongPress(float& nx, float& ny) const;
+  // Ignore the remainder of the current contact (its continued hold and its
+  // release edge). Self-clears once the contact ends.
+  void suppressTouchContact();
   unsigned long lastTouchHeldMs() const;
   bool wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd) const;
   bool wasTouchActivity() const;

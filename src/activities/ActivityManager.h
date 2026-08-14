@@ -66,10 +66,6 @@ class ActivityManager {
   // This variable must only be set by the main loop, to avoid race conditions
   std::atomic<bool> requestedUpdate{false};
 
-  // Consume the complete Up+Down chord through release so it cannot also turn
-  // a page or move a menu selection.
-  bool frontlightChordLatched = false;
-
  public:
   explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {

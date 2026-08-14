@@ -1,3 +1,0 @@
-brightness = sun
-warmth = sun-snow
-power = power

@@ -80,6 +80,22 @@ inline TouchPageTurn detectTouchPageTurn(GfxRenderer& renderer, const MappedInpu
     return result;
   }
 
+  if (SETTINGS.touchReaderControls == CrossPointSettings::TOUCH_READER_SWIPE) {
+    // Swipe mode: horizontal swipes turn pages, taps do nothing. Swipe left =
+    // next page, swipe right = previous. The reading surface has no
+    // swipe-to-exit on any board (handleBackNavigation ignores the back
+    // gesture; home is the bottom-edge up-swipe or the capacitive key), so
+    // every right swipe pages back. heldMs stays 0: a slow swipe must never
+    // register as a long press (chapter skip).
+    const auto dir = input.wasSwipe();
+    if (dir == MappedInputManager::SwipeDir::Left) {
+      result.next = true;
+    } else if (dir == MappedInputManager::SwipeDir::Right) {
+      result.prev = true;
+    }
+    return result;
+  }
+
   int x = 0;
   int y = 0;
   if (!input.wasScreenTapped(x, y)) {
@@ -88,11 +104,12 @@ inline TouchPageTurn detectTouchPageTurn(GfxRenderer& renderer, const MappedInpu
 
   const int16_t width = static_cast<int16_t>(renderer.getScreenWidth());
   const int16_t height = static_cast<int16_t>(renderer.getScreenHeight());
-  const int16_t previousZoneWidth = width / 3;
+  // Outer thirds only: the middle third is the reader-menu tap
+  // (isTouchMenuTap below), so it must not double as a page turn.
+  const int16_t zoneWidth = width / 3;
   const freeink::ui::TapZone zones[] = {
-      {freeink::ui::Rect{0, 0, previousZoneWidth, height}, READER_TOUCH_PREV},
-      {freeink::ui::Rect{previousZoneWidth, 0, static_cast<int16_t>(width - previousZoneWidth), height},
-       READER_TOUCH_NEXT},
+      {freeink::ui::Rect{0, 0, zoneWidth, height}, READER_TOUCH_PREV},
+      {freeink::ui::Rect{static_cast<int16_t>(width - zoneWidth), 0, zoneWidth, height}, READER_TOUCH_NEXT},
   };
 
   for (const auto& zone : zones) {
@@ -105,9 +122,28 @@ inline TouchPageTurn detectTouchPageTurn(GfxRenderer& renderer, const MappedInpu
   return result;
 }
 
-// Reader menu opens on a downward swipe from the top edge (replaces the old center tap-and-hold).
-inline bool isTouchMenuGesture(const MappedInputManager& input) {
-  return SETTINGS.touchReaderControls && input.hasTouch() && input.wasMenuGesture();
+// Tap in the middle third of the screen: the tap path into the reader menu on
+// every touch board. The page-turn tap zones are the outer thirds, so the
+// middle is free in tap mode.
+inline bool isTouchMenuTap(const GfxRenderer& renderer, const MappedInputManager& input) {
+  if (!input.hasTouch()) return false;
+  int x = 0;
+  int y = 0;
+  if (!input.wasScreenTapped(x, y)) return false;
+  const int width = renderer.getScreenWidth();
+  return x >= width / 3 && x < (2 * width) / 3;
+}
+
+// Reader menu opens on the menu edge-swipe or a middle-third tap. On home-key
+// boards a long press of the capacitive key runs the user-selected long-press
+// function instead (SETTINGS.longPressMenuFunction), not the menu.
+// With touch reader controls Off the reading surface ignores touch entirely,
+// menu included, so a stray brush of the screen can't open it; the menu stays
+// reachable via Confirm — the front button, a short power click bound to
+// Confirm (SHORT_PWRBTN::PWR_CONFIRM), or the home-key long-press function.
+inline bool isTouchMenuGesture(const GfxRenderer& renderer, const MappedInputManager& input) {
+  if (!SETTINGS.touchReaderControls) return false;
+  return (input.hasTouch() && input.wasMenuGesture()) || isTouchMenuTap(renderer, input);
 }
 
 // One helper, blocking or deferred: the async form starts the refresh and
@@ -129,6 +165,22 @@ inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntil
   }
 }
 
+// Front half of a combined grayscale activation, for panels whose driver
+// defers the base (combinesGrayscaleBase, SSD1683): same cadence bookkeeping
+// as displayWithRefreshCycle, but the BW target is stashed instead of
+// activated, so the gray planes streamed afterward join it in a single
+// waveform. A separate BW refresh first would make the gray pass re-drive the
+// whole text through the custom LUT's kick phases (visible flash).
+inline void displayGrayscaleBaseWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+  const auto mode = (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+  renderer.displayGrayscaleBase(mode);
+  if (pagesUntilFullRefresh <= 1) {
+    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+  } else {
+    pagesUntilFullRefresh--;
+  }
+}
+
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
 // the grayscale buffer. Only the content callback is re-rendered — status bars
 // and other overlays should be drawn before calling this.
@@ -137,6 +189,12 @@ template <typename RenderFn>
 void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
   if (!renderer.storeBwBuffer()) {
     LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
+    if (renderer.combinesGrayscaleBase()) {
+      // The caller deferred the base into this pass (displayGrayscaleBase);
+      // the driver's cleanup commits the stashed BW target so the page still
+      // reaches the panel, just without grays.
+      renderer.cleanupGrayscaleWithFrameBuffer();
+    }
     return;
   }
 
@@ -170,6 +228,22 @@ struct BackNavCallback {
 // - with backShortToFileBrowser: go to file browser.
 inline bool handleBackNavigation(const MappedInputManager& mappedInput, ActivityManager& activityManager,
                                  const char* filePath, BackNavCallback goHome) {
+  // The reading surface deliberately has no swipe-to-exit path on any touch
+  // board: the bottom-edge up-swipe (or the capacitive home key on X4 Pro)
+  // already exits, and in swipe page-turn mode a right swipe must page back
+  // instead. Back swipes stay available in menus and other activities; only
+  // this reader-surface handler ignores them. Physical Back buttons are
+  // unaffected: isPressed() is button-only, and this guard skips just the
+  // gesture's own release frame.
+  if (mappedInput.wasBackGesture()) {
+    return false;
+  }
+  // Home-key readers additionally have no assigned physical Back input, so
+  // nothing below can fire; the capacitive Home key leaves the book.
+  if (mappedInput.hasHomeKey()) {
+    return false;
+  }
+
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= GO_BACK_OR_HOME_MS) {
     if (SETTINGS.backShortToFileBrowser) {
       goHome.fn(goHome.ctx);

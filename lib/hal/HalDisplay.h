@@ -38,6 +38,11 @@ class HalDisplay {
   void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                             bool fromProgmem = false) const;
 
+  // Persistent black/white output inversion provided by FreeInkDisplay.
+  void setInverted(bool inverted);
+  bool toggleInverted();
+  bool isInverted() const;
+
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
   // Non-blocking refresh (shadow-free): starts the panel waveform and returns
   // while the panel refreshes on its own. The framebuffer must stay untouched
@@ -91,6 +96,9 @@ class HalDisplay {
   // EInkDisplay::writeGrayscalePlaneStrip.
   void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows);
   bool supportsStripGrayscale() const;
+  // Driver defers the grayscale base so base + planes go out in one waveform
+  // (SSD1683). Route the AA base through displayGrayscaleBase() when true.
+  bool combinesGrayscaleBase() const;
 
   // Runtime geometry passthrough
   uint16_t getDisplayWidth() const;

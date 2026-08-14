@@ -3,6 +3,11 @@
 #include <HalGPIO.h>
 
 class GfxRenderer;
+namespace freeink {
+namespace ui {
+enum class ScreenEdge : uint8_t;
+}
+}  // namespace freeink
 
 class MappedInputManager {
  public:
@@ -35,18 +40,34 @@ class MappedInputManager {
   MappedInputManager(HalGPIO& gpio, const GfxRenderer& renderer) : gpio(gpio), renderer(renderer) {}
 
   void update() const { gpio.update(); }
+  // PWR_CONFIRM on boards with the power-button double-click frontlight toggle
+  // (X4 Pro): the main loop's click tracker calls this every frame, true for
+  // exactly the frame where a single click matured (double-click window passed
+  // with no second click). wasPowerConfirmClick reads it instead of the raw
+  // release edge on those boards.
+  void setPowerConfirmClickFrame(const bool clicked) { powerConfirmClickFrame = clicked; }
   bool wasPressed(Button button) const;
   bool wasReleased(Button button) const;
   bool isPressed(Button button) const;
   bool hasTouch() const;
+  // True on boards with a capacitive home key (X4 Pro), where the bottom-edge
+  // up-swipe is the reader-menu gesture rather than the exit-to-home gesture.
+  bool hasHomeKey() const { return gpio.hasHomeKey(); }
   bool wasScreenTapped(int& x, int& y) const;
   bool wasScreenTouchDown(int& x, int& y) const;
+  // One-shot long-press from the SDK touch classifier, fired WHILE the finger
+  // is still down (stationary contact held past the SDK threshold). Consuming
+  // it suppresses the remainder of the contact — its continued hold and its
+  // release edge — so the ensuing finger lift can't also tap-dismiss the popup
+  // the long-press opened. The SDK owns that latch and self-clears it once the
+  // contact ends.
+  bool wasScreenLongPress(int& x, int& y) const;
   bool isScreenTouchHeld(int& x, int& y) const;
+  // Raw release edge, also true when the contact ended in a swipe or drag-off
+  // (which wasScreenTapped never reports). InputSnapshot builders forward it
+  // off-target so FreeInkUI routing clears its pressed-element state.
+  bool wasScreenTouchReleased() const;
   bool wasTapInRect(int x, int y, int width, int height) const;
-  bool wasListItemTapped(int& index, int itemCount, int selectedIndex, int listTop, int listHeight,
-                         bool hasSubtitle) const;
-  bool wasListItemTouchedDown(int& index, int itemCount, int selectedIndex, int listTop, int listHeight,
-                              bool hasSubtitle) const;
 
   // Combined touch interaction for a band of equal rows with caller-supplied
   // geometry — the shared hit-test for lists the theme helpers above do not
@@ -61,8 +82,24 @@ class MappedInputManager {
   RowTouch colTouch(int& col, int left, int colStep, int colCount, int yStart, int yEnd, int colWidth = 0) const;
 
   SwipeDir wasSwipe() const;
+  // Back = left-to-right swipe anchored at the left edge. Public so swipe-mode
+  // page turns (reader) can exclude it from a plain SwipeDir::Right.
+  bool wasBackGesture() const;
+  // Exit-to-home intent. Boards with a capacitive home key (X4 Pro) use the
+  // key's press edge; everywhere else it's the bottom-edge up-swipe.
   bool wasHomeGesture() const;
+  // Contextual menu intent (the reader menu). Home-key boards move this to the
+  // bottom-edge up-swipe (freed by the home key); others keep the top-edge
+  // down-swipe.
   bool wasMenuGesture() const;
+  // Frontlight quick panel: top-edge down-swipe on any board with a frontlight
+  // (Frontlight.present()). Takes priority over the top-edge menu gesture;
+  // the menu remains reachable via Confirm and the middle-third tap.
+  bool wasLightPanelGesture() const;
+  // Long press of the capacitive home key (home-key boards only). A short tap
+  // goes home; the hold runs the user-selected long-press function
+  // (SETTINGS.longPressMenuFunction) in the reader.
+  bool wasHomeKeyHold() const;
   bool wasAnyPressed() const;
   bool wasAnyReleased() const;
   unsigned long getHeldTime() const;
@@ -93,14 +130,20 @@ class MappedInputManager {
   Button mapScreenDirection(Button button) const;
   Labels mapFrontLabels(const char* back, const char* confirm, const char* left, const char* right) const;
   bool mapButton(Button button, bool (HalGPIO::*fn)(uint8_t) const) const;
-  bool wasBackGesture() const;
+  // SDK edge classification (fui::edgeSwipe) + the shared decode/held-time
+  // bookkeeping; the wrappers below give each edge its board meaning.
+  bool wasEdgeSwipe(freeink::ui::ScreenEdge edge) const;
+  bool wasTopEdgeDownSwipe() const;
+  bool wasBottomEdgeUpSwipe() const;
   // Fetch the pending swipe (if any) and map both endpoints to logical screen coords
   bool decodeSwipe(int& sx, int& sy, int& ex, int& ey) const;
-  bool listItemFromPoint(int x, int y, int& index, int itemCount, int selectedIndex, int listTop, int listHeight,
-                         bool hasSubtitle) const;
+  // Short power click mapped to Confirm (SHORT_PWRBTN::PWR_CONFIRM binding).
+  bool wasPowerConfirmClick() const;
   void rememberTouchHeldTime() const;
 
   mutable bool touchHeldOverrideValid = false;
   mutable unsigned long touchHeldOverrideMs = 0;
   mutable unsigned long touchHeldOverrideAt = 0;
+  // Frame-scoped matured power click (see setPowerConfirmClickFrame).
+  bool powerConfirmClickFrame = false;
 };
