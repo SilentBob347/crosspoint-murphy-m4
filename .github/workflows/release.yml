@@ -33,15 +33,15 @@ jobs:
           restore-keys: pio-${{ runner.os }}-
 
       - name: Build CrossPoint
-        run: pio run -e gh_release
+        run: pio run -e murphy_m4
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: CrossPoint-${{ github.ref_name }}
           path: |
-            .pio/build/gh_release/bootloader.bin
-            .pio/build/gh_release/firmware.bin
-            .pio/build/gh_release/firmware.elf
-            .pio/build/gh_release/firmware.map
-            .pio/build/gh_release/partitions.bin
+            .pio/build/murphy_m4/bootloader.bin
+            .pio/build/murphy_m4/firmware.bin
+            .pio/build/murphy_m4/firmware.elf
+            .pio/build/murphy_m4/firmware.map
+            .pio/build/murphy_m4/partitions.bin

@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+
 #include <FreeInkApp.h>
 #include <FreeInkUIGfxRenderer.h>
 #include <FreeInkUIIcon.h>
@@ -20,17 +22,29 @@
 // on every screen entry, so theme or font changes between activities
 // re-derive it; live theme changes (Settings) refresh it in place and every
 // referencing app repaints in the new look.
-inline freeink::ui::ThemeTokens& sharedUiThemeTokens() {
-  static freeink::ui::ThemeTokens tokens;
-  return tokens;
+struct SharedUiTheme {
+  freeink::ui::ThemeTokens tokens[2];
+  std::atomic<const freeink::ui::ThemeTokens*> active{&tokens[0]};
+
+  void update(const freeink::ui::ThemeTokens& next) {
+    auto* inactive = active.load(std::memory_order_relaxed) == &tokens[0] ? &tokens[1] : &tokens[0];
+    *inactive = next;
+    active.store(inactive, std::memory_order_release);
+  }
+};
+
+inline SharedUiTheme& sharedUiTheme() {
+  static SharedUiTheme theme;
+  return theme;
 }
 
 // Refresh the shared tokens from the active UITheme + this target's fonts and
 // point the app at them. Replaces the old per-app `app.setTheme(...)` copies.
 template <typename App>
 inline void applySharedUiTheme(App& app, const freeink::ui::GfxRendererTarget& target) {
-  sharedUiThemeTokens() = uiThemeTokens(target);
-  app.setThemeRef(&sharedUiThemeTokens());
+  auto& theme = sharedUiTheme();
+  theme.update(uiThemeTokens(target));
+  app.setThemeRef(&theme.active);
 }
 
 // Bind the uiScale fonts before FreeInkApp's constructor derives its theme
