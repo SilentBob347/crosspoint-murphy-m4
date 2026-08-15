@@ -40,8 +40,8 @@ class MappedInputManager {
   MappedInputManager(HalGPIO& gpio, const GfxRenderer& renderer) : gpio(gpio), renderer(renderer) {}
 
   void update() const { gpio.update(); }
-  // PWR_CONFIRM on boards with the power-button double-click frontlight toggle
-  // (X4 Pro): the main loop's click tracker calls this every frame, true for
+  // PWR_CONFIRM on boards with the power-button double-click frontlight toggle:
+  // the main loop's click tracker calls this every frame, true for
   // exactly the frame where a single click matured (double-click window passed
   // with no second click). wasPowerConfirmClick reads it instead of the raw
   // release edge on those boards.

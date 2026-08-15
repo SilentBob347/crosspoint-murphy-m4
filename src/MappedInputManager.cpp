@@ -306,12 +306,12 @@ bool MappedInputManager::wasLightPanelGesture() const {
 // hold-to-act consumers (delete prompts) stay physical-Confirm only.
 bool MappedInputManager::wasPowerConfirmClick() const {
   if (SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM) return false;
-  // The X4 Pro's power button also carries the double-click frontlight toggle,
+  // A frontlight board's power button also carries the double-click toggle,
   // so a raw release cannot fire Confirm immediately: the first click of a
   // double would open the menu before the second click toggled the light.
   // main.cpp's click tracker disambiguates and feeds the matured single click
   // in via setPowerConfirmClickFrame once the double-click window passes.
-  if (BoardConfig::isX4Pro()) return powerConfirmClickFrame;
+  if (Frontlight.present()) return powerConfirmClickFrame;
   // The held-time gate drops the release of a long hold that did not reach the
   // sleep path (e.g. the power-on hold carried into the first frames after
   // wake); a genuine click is always shorter than the sleep threshold.
